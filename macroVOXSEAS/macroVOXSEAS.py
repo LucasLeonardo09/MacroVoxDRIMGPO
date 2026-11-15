@@ -92,16 +92,54 @@ def carregar_cfg():
 
 
 # ---------------- detecção ----------------
-def maior_regiao(mask):
-    """Retorna (x, y, w, h) da maior mancha da máscara, ou None."""
+def caixa_barra(mask, altura_img):
+    """Caixa (x, y, w, h) da barra verde, ou None.
+
+    Quando o peixe passa na frente, ele corta a barra em duas partes (uma acima e outra abaixo dele).
+    Por isso junta todas as partes verdes que estão perto uma da outra, em vez de usar só a maior.
+    """
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contornos:
+    n, _, st, _ = cv2.connectedComponentsWithStats(mask)
+    partes = [tuple(int(v) for v in st[k]) for k in range(1, n) if st[k][4] >= MIN_AREA]
+    if not partes:
         return None
-    c = max(contornos, key=cv2.contourArea)
-    if cv2.contourArea(c) < MIN_AREA:
-        return None
-    return cv2.boundingRect(c)
+    x, y, w, h, _ = max(partes, key=lambda p: p[4])
+    x0, x1, t, b = x, x + w, y, y + h
+    gap_max = 0.3 * altura_img
+    usadas = {max(partes, key=lambda p: p[4])}
+    mudou = True
+    while mudou:
+        mudou = False
+        for p in partes:
+            if p in usadas:
+                continue
+            px, py, pw, ph, _ = p
+            gap = max(py - b, t - (py + ph), 0)
+            if gap <= gap_max:
+                x0, x1 = min(x0, px), max(x1, px + pw)
+                t, b = min(t, py), max(b, py + ph)
+                usadas.add(p)
+                mudou = True
+    return (x0, t, x1 - x0, b - t)
+
+
+def centro_barra(caixa, peixe_cy, altura_img, h_barra):
+    """Centro (em y) da barra verde, corrigindo quando parte dela está escondida.
+
+    A barra pode estar parcialmente tapada pelo peixe ou cortada pela borda da zona. Nesses casos o centro
+    da parte visível engana, então usa a ponta que continua visível e a altura normal da barra.
+    """
+    _, y, _, h = caixa
+    t, b = y, y + h
+    if h >= 0.93 * h_barra:
+        return (t + b) / 2
+    if t <= 1 and b < altura_img - 1:      # cortada pela borda de cima da zona
+        return b - h_barra / 2
+    if b >= altura_img - 1 and t > 1:      # cortada pela borda de baixo da zona
+        return t + h_barra / 2
+    if peixe_cy is not None:               # tapada pelo peixe: usa a ponta mais longe dele
+        return b - h_barra / 2 if peixe_cy < (t + b) / 2 else t + h_barra / 2
+    return (t + b) / 2
 
 
 def candidatos_laranja(mask):
@@ -140,7 +178,7 @@ def escolher_peixe(cands, altura_img, ultimo_y=None, limite_salto=None):
 def analisar(img_bgr, ultimo_y=None, limite_salto=None):
     """Devolve (caixa_verde, peixe, candidatos). A caixa verde é (x, y, w, h); o peixe é um dict ou None."""
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    caixa_verde = maior_regiao(cv2.inRange(hsv, VERDE_MIN, VERDE_MAX))
+    caixa_verde = caixa_barra(cv2.inRange(hsv, VERDE_MIN, VERDE_MAX), img_bgr.shape[0])
     cands = candidatos_laranja(cv2.inRange(hsv, LARANJA_MIN, LARANJA_MAX))
     peixe = escolher_peixe(cands, img_bgr.shape[0], ultimo_y, limite_salto)
     return caixa_verde, peixe, cands
@@ -280,7 +318,7 @@ class App(ctk.CTk):
         self.foto_ate = 0.0
 
         # ---------- cabeçalho ----------
-        ctk.CTkLabel(self, text="Pesca Macro", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(16, 8))
+        ctk.CTkLabel(self, text="Pesca Macro - By DRIMGPO", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(16, 8))
 
         self.lbl_loop = ctk.CTkLabel(self, text="Main Loop: OFF", text_color=COR_OFF)
         self.lbl_loop.pack()
@@ -516,8 +554,8 @@ class App(ctk.CTk):
                         self.status = f"Pescando... ({fps:.0f} fps)"
                     proximo_clique = relogio + self.intervalo  # não lança enquanto pesca
 
-                    verde_y = caixa_verde[1] + caixa_verde[3] / 2
                     h_barra = piloto.altura_barra(caixa_verde[3])
+                    verde_y = centro_barra(caixa_verde, peixe["cy"], img.shape[0], h_barra)
                     self.clicar(piloto.decidir(agora, verde_y, peixe["cy"], h_barra, self.antecip_ms))
 
                 elif estava_pescando and agora - ultimo_visto < GRACA_S:
