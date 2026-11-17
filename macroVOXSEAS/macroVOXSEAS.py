@@ -37,26 +37,38 @@ CFG_PADRAO = {
     "antecip_ms": 280.0,  # amortecimento (ms)
     "intervalo": 6.0,     # intervalo entre cliques (s)
     "pausa": 3.0,         # espera após pescar (s)
+    "haki": 1.0,          # 1 = usa o peixe fantasma do Haki da observação
 }
 
 # Faixas de cor em HSV (H vai de 0 a 180 no OpenCV)
-VERDE_MIN = np.array([40, 100, 100])
+# S e V altos: só o verde vivo da barra. O peixe fantasma do Haki é verde escuro e apagado (S~100-140, V~100-135)
+# e, com a faixa antiga, era confundido com a barra e esticava a caixa dela.
+VERDE_MIN = np.array([40, 180, 170])
 VERDE_MAX = np.array([85, 255, 255])
 LARANJA_MIN = np.array([5, 100, 140])
 LARANJA_MAX = np.array([30, 255, 255])
+FANTASMA_MIN = np.array([38, 25, 0])    # peixe escuro/translúcido do Haki da observação
+FANTASMA_MAX = np.array([96, 255, 165])
 MIN_AREA = 25  # área mínima (em pixels) para considerar que achou algo
+MIN_LARGURA_PEIXE = 0.5  # o peixe tem pelo menos esta fração da largura da barra verde (barrinha de progresso e pontas de enfeite são mais finas)
 
 # ---------------- controle da barra ----------------
 # Tudo em "alturas de barra" (a altura da barra verde vira a unidade), então não depende do tamanho da tela.
 # Valores estimados a partir de vídeos do minigame; só mexa se souber o que está fazendo.
-LATENCIA_S = 0.10     # atraso entre o clique e a barra reagir
-ACEL_SOBE = 7.0       # aceleração para cima com o clique segurado (alturas de barra / s²)
-ACEL_CAI = 5.2        # aceleração para baixo com o clique solto
-KP = 12.0             # força com que a barra é puxada para o peixe
-KD_BASE = 7.0         # freio (valor com amortecimento de AMORT_REF_MS)
+LATENCIA_S = 0.14     # atraso entre o clique e a barra reagir
+ACEL_SOBE = 5.7       # aceleração para cima com o clique segurado (alturas de barra / s²)
+ACEL_CAI = 5.4        # aceleração para baixo com o clique solto
+KP = 20.0             # força com que a barra é puxada para o peixe
+KD_BASE = 8.5         # freio (valor com amortecimento de AMORT_REF_MS)
 AMORT_REF_MS = 280.0  # o slider "Amortecimento" escala o freio em relação a este valor
 PERIODO_PWM = 0.10    # o clique é ligado/desligado neste ritmo para a barra "ficar parada" (s)
+ADIANTO_HAKI_S = 0.93  # o fantasma mostra onde o peixe real estará daqui a ~0,93 s (medido em vídeo)
+PESO_HAKI = 0.85       # quanto confiar no fantasma (0 a 1) quando ele parece coerente
 GRACA_S = 0.25        # se perder barra/peixe por menos que isso, mantém o último comando (s)
+PERDA_PEIXE_S = 1.5   # barra visível mas peixe sumiu (ex.: colado no enfeite do topo): segue controlando por até isso (s)
+TROCA_MIN_S = 0.03    # tempo mínimo entre soltar e apertar (e vice-versa): trocas de poucos ms o Roblox perde ou inverte
+REFORCO_S = 0.10      # enquanto o clique está segurado, reenvia o 'apertar' neste ritmo para corrigir qualquer perda (s)
+BORDA_PEIXE = 0.25    # se o peixe sumiu a menos dessa fração da altura de uma borda, supõe que ele está encostado nela
 
 COR_ON = "#2ecc71"
 COR_OFF = "#5dade2"
@@ -143,14 +155,17 @@ def centro_barra(caixa, peixe_cy, altura_img, h_barra):
 
 
 def candidatos_laranja(mask):
-    """Todas as manchas laranja da máscara: lista de dicts com x, y, w, h, area, cy."""
+    """Todas as manchas laranja da máscara: lista de dicts com x, y, w, h, area, cy, cx.
+
+    O filtro por tamanho/posição em relação à barra verde é feito em analisar().
+    """
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, _, st, _ = cv2.connectedComponentsWithStats(mask)
     lista = []
     for k in range(1, n):
         x, y, w, h, area = (int(v) for v in st[k])
         if area >= MIN_AREA:
-            lista.append({"x": x, "y": y, "w": w, "h": h, "area": area, "cy": y + h / 2})
+            lista.append({"x": x, "y": y, "w": w, "h": h, "area": area, "cy": y + h / 2, "cx": x + w / 2})
     return lista
 
 
@@ -175,13 +190,42 @@ def escolher_peixe(cands, altura_img, ultimo_y=None, limite_salto=None):
     return None
 
 
-def analisar(img_bgr, ultimo_y=None, limite_salto=None):
-    """Devolve (caixa_verde, peixe, candidatos). A caixa verde é (x, y, w, h); o peixe é um dict ou None."""
+def achar_fantasma(hsv, mask_verde, mask_laranja, altura_img):
+    """Centro (y, em pixels) do peixe fantasma, ou None. Ignora o que encosta no topo/fundo (enfeites, algas)."""
+    m = cv2.inRange(hsv, FANTASMA_MIN, FANTASMA_MAX)
+    k = np.ones((5, 5), np.uint8)
+    m[cv2.dilate(mask_verde, k) > 0] = 0
+    m[cv2.dilate(mask_laranja, k) > 0] = 0
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, _, st, cen = cv2.connectedComponentsWithStats(m)
+    melhor = None
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if area < 60 or y <= 1 or y + h >= altura_img - 1:
+            continue
+        if not 0.08 * altura_img < cen[i][1] < 0.92 * altura_img:
+            continue  # enfeites do topo/fundo
+        if melhor is None or area > melhor[0]:
+            melhor = (area, float(cen[i][1]))
+    return None if melhor is None else melhor[1]
+
+
+def analisar(img_bgr, ultimo_y=None, limite_salto=None, com_fantasma=False):
+    """Devolve (caixa_verde, peixe, candidatos, fantasma_y). A caixa verde é (x, y, w, h); o peixe é um dict ou None."""
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    caixa_verde = caixa_barra(cv2.inRange(hsv, VERDE_MIN, VERDE_MAX), img_bgr.shape[0])
-    cands = candidatos_laranja(cv2.inRange(hsv, LARANJA_MIN, LARANJA_MAX))
+    mv = cv2.inRange(hsv, VERDE_MIN, VERDE_MAX)
+    ml = cv2.inRange(hsv, LARANJA_MIN, LARANJA_MAX)
+    caixa_verde = caixa_barra(mv, img_bgr.shape[0])
+    cands = candidatos_laranja(ml)
+    if caixa_verde is not None:
+        # o peixe nada dentro do tubo, alinhado com a barra verde e largo como ela (a zona pode cortá-lo, mas
+        # ele continua largo). O que é fino ou está longe na horizontal (barrinha de progresso, pontas dos
+        # enfeites) não é o peixe.
+        cx_verde, w_verde = caixa_verde[0] + caixa_verde[2] / 2, caixa_verde[2]
+        cands = [c for c in cands if c["w"] >= MIN_LARGURA_PEIXE * w_verde and abs(c["cx"] - cx_verde) <= w_verde]
     peixe = escolher_peixe(cands, img_bgr.shape[0], ultimo_y, limite_salto)
-    return caixa_verde, peixe, cands
+    fantasma = achar_fantasma(hsv, mv, ml, img_bgr.shape[0]) if com_fantasma else None
+    return caixa_verde, peixe, cands, fantasma
 
 
 class Piloto:
@@ -205,12 +249,27 @@ class Piloto:
         self.vf = 0.0        # velocidade do peixe
         self.hist = deque()  # (instante, aceleração comandada) dos últimos LATENCIA_S
         self.alturas.clear()
+        self.fant = deque()  # (instante, y do fantasma em alturas de barra)
+
+    def alvo_haki(self, agora, h_px, fantasma_y_px):
+        """Posição (em alturas de barra) onde o peixe deve estar daqui a LATENCIA_S, segundo o fantasma; ou None."""
+        if fantasma_y_px is not None:
+            self.fant.append((agora, fantasma_y_px / h_px))
+        while self.fant and agora - self.fant[0][0] > 3.0:
+            self.fant.popleft()
+        quer = agora - (ADIANTO_HAKI_S - LATENCIA_S)
+        if not self.fant or self.fant[0][0] > quer:
+            return None  # ainda sem histórico suficiente
+        melhor = min(self.fant, key=lambda r: abs(r[0] - quer))
+        if abs(melhor[0] - quer) > 0.25:
+            return None
+        return melhor[1]
 
     def altura_barra(self, h_px):
         self.alturas.append(max(float(h_px), 1.0))
         return max(float(np.percentile(self.alturas, 80)), 10.0)
 
-    def decidir(self, agora, verde_y_px, peixe_y_px, h_barra_px, amort_ms):
+    def decidir(self, agora, verde_y_px, peixe_y_px, h_barra_px, amort_ms, fantasma_y_px=None, usar_haki=False):
         y = verde_y_px / h_barra_px
         f = peixe_y_px / h_barra_px
         if self.t_ant is not None:
@@ -228,6 +287,13 @@ class Piloto:
         vp = self.vel + a_med * LATENCIA_S
         yp = y + self.vel * LATENCIA_S + 0.5 * a_med * LATENCIA_S ** 2
         fp = f + self.vf * LATENCIA_S
+        if usar_haki:
+            alvo = self.alvo_haki(agora, h_barra_px, fantasma_y_px)
+            if alvo is not None and abs(alvo - fp) < 2.5:  # só confia se for coerente com o peixe real
+                fp = (1 - PESO_HAKI) * fp + PESO_HAKI * alvo
+            # o peixe vai parar no fantasma: já empurra a barra para lá, até o limite em que o peixe ainda cabe nela
+            if self.fant and agora - self.fant[-1][0] < 0.5:
+                fp += max(-0.45, min(0.45, self.fant[-1][1] - fp))
 
         kd = KD_BASE * max(amort_ms, 0.0) / AMORT_REF_MS
         a_des = -KP * (yp - fp) - kd * (vp - self.vf)  # negativo = quer subir
@@ -307,18 +373,22 @@ class App(ctk.CTk):
         self.overlay = None
         self.ligado = False
         self.segurando = False
+        self.t_troca = 0.0    # quando o clique mudou de estado pela última vez
+        self.t_reforco = 0.0  # quando o 'apertar' foi enviado pela última vez
         self.antecip_ms = cfg["antecip_ms"]  # amortecimento (ms): quanto o macro "freia" a barra
         self.intervalo = cfg["intervalo"]
         self.pausa = cfg["pausa"]  # segundos de espera após a barra sumir, antes de lançar de novo
         self.auto_clique = True
+        self.haki = bool(cfg["haki"])  # usa o peixe fantasma do Haki da observação
         self.status = "Parado"
         self.thread = None
         self.pedido_toggle = False
         self.pedido_captura = False
+        self.pedido_log = False
         self.foto_ate = 0.0
 
         # ---------- cabeçalho ----------
-        ctk.CTkLabel(self, text="Pesca Macro - By DRIMGPO", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(16, 8))
+        ctk.CTkLabel(self, text="Macro Vox - By DRIMGPO", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(16, 8))
 
         self.lbl_loop = ctk.CTkLabel(self, text="Main Loop: OFF", text_color=COR_OFF)
         self.lbl_loop.pack()
@@ -356,9 +426,14 @@ class App(ctk.CTk):
         s.set(self.antecip_ms)
         s.pack(padx=20, pady=(4, 0), fill="x")
 
+        self.sw_haki = ctk.CTkSwitch(aba_macro, text="Haki da observação (peixe fantasma)", command=self.alternar_haki)
+        if self.haki:
+            self.sw_haki.select()
+        self.sw_haki.pack(pady=(18, 0))
+
         self.sw_topo = ctk.CTkSwitch(aba_macro, text="Sempre no topo", command=self.alternar_topo)
         self.sw_topo.select()
-        self.sw_topo.pack(pady=(18, 0))
+        self.sw_topo.pack(pady=(12, 0))
 
         # --- aba Detecção ---
         self.btn_zona = ctk.CTkButton(aba_det, text="Zona de pesca", height=34, command=self.alternar_overlay)
@@ -375,12 +450,13 @@ class App(ctk.CTk):
         self.btn_start.pack(padx=25, pady=(12, 4), fill="x")
 
         ctk.CTkLabel(
-            self, text="F6 liga/desliga  •  F8 salva uma foto do que o macro enxerga",
+            self, text="F6 liga/desliga  •  F8 foto do que o macro vê  •  F9 salva o log dos últimos 20 s",
             text_color="gray60", font=ctk.CTkFont(size=11),
         ).pack()
 
         keyboard.add_hotkey("F6", lambda: setattr(self, "pedido_toggle", True))
         keyboard.add_hotkey("F8", lambda: setattr(self, "pedido_captura", True))
+        keyboard.add_hotkey("F9", lambda: setattr(self, "pedido_log", True))
         self.after(100, self.checar_atalhos)
         self.protocol("WM_DELETE_WINDOW", self.fechar)
 
@@ -396,7 +472,8 @@ class App(ctk.CTk):
         try:
             with open(ARQ_CFG, "w") as f:
                 json.dump(
-                    {"antecip_ms": self.antecip_ms, "intervalo": self.intervalo, "pausa": self.pausa},
+                    {"antecip_ms": self.antecip_ms, "intervalo": self.intervalo, "pausa": self.pausa,
+                     "haki": 1.0 if self.haki else 0.0},
                     f,
                 )
         except Exception:
@@ -423,6 +500,10 @@ class App(ctk.CTk):
 
     def alternar_auto(self):
         self.auto_clique = bool(self.sw_auto.get())
+
+    def alternar_haki(self):
+        self.haki = bool(self.sw_haki.get())
+        self.salvar_cfg()
 
     def alternar_topo(self):
         self.attributes("-topmost", bool(self.sw_topo.get()))
@@ -475,17 +556,28 @@ class App(ctk.CTk):
         self.destroy()
 
     # ---------- macro (roda em outra thread) ----------
-    def clicar(self, segurar):
-        if segurar and not self.segurando:
+    def clicar(self, segurar, forcar=False):
+        """Aperta/solta o botão esquerdo, com duas proteções (o log mostrou o clique "grudando" para o jogo):
+        1) não troca de estado mais rápido que TROCA_MIN_S (apertar/soltar em ~8 ms se perde ou inverte no Roblox);
+        2) enquanto segura, reenvia o 'apertar' a cada REFORCO_S, para se recuperar se o jogo achar que soltou.
+        """
+        agora = time.perf_counter()
+        if segurar != self.segurando:
+            if not forcar and agora - self.t_troca < TROCA_MIN_S:
+                return  # cedo demais: a próxima volta do loop tenta de novo
+            if segurar:
+                pydirectinput.mouseDown()
+            else:
+                pydirectinput.mouseUp()
+            self.segurando = segurar
+            self.t_troca = self.t_reforco = agora
+        elif segurar and agora - self.t_reforco >= REFORCO_S:
             pydirectinput.mouseDown()
-            self.segurando = True
-        elif not segurar and self.segurando:
-            pydirectinput.mouseUp()
-            self.segurando = False
+            self.t_reforco = agora
 
     def lancar(self):
         """Um clique rápido para lançar a vara."""
-        self.clicar(False)
+        self.clicar(False, forcar=True)
         pydirectinput.mouseDown()
         time.sleep(0.08)
         pydirectinput.mouseUp()
@@ -494,7 +586,7 @@ class App(ctk.CTk):
         """F8: salva uma foto da zona mostrando o que o macro enxergou (para diagnóstico)."""
         try:
             vis = img.copy()
-            for c in cands:  # todas as manchas laranja: amarelo
+            for c in cands:  # todas as manchas laranja aceitas: amarelo
                 cv2.rectangle(vis, (c["x"], c["y"]), (c["x"] + c["w"], c["y"] + c["h"]), (0, 255, 255), 1)
             if caixa_verde is not None:  # barra verde: vermelho
                 x, y, w, h = caixa_verde
@@ -514,6 +606,27 @@ class App(ctk.CTk):
         except Exception:
             self.status = "Não consegui salvar a foto"
 
+    def salvar_log(self, registro):
+        """F9: grava em log_macro.csv o que o macro viu e decidiu nos últimos ~20 s (para diagnóstico)."""
+        try:
+            with open(os.path.join(PASTA, "log_macro.csv"), "w", encoding="utf-8") as f:
+                f.write("t_s;barra_y;peixe_y;altura_barra;segurando;peixe\n")
+                for t, by, fy, hb, seg, estado in registro:
+                    f.write(f"{t:.3f};{by:.1f};{fy:.1f};{hb:.1f};{int(seg)};{estado}\n")
+            self.status = "Log salvo: log_macro.csv"
+            self.foto_ate = time.time() + 2.0
+        except Exception:
+            self.status = "Não consegui salvar o log"
+
+    @staticmethod
+    def supor_peixe(ultimo_y, altura):
+        """Peixe sumiu com a barra ainda na tela: se ele sumiu perto de uma borda, supõe que está encostado nela."""
+        if ultimo_y < BORDA_PEIXE * altura:
+            return 0.06 * altura
+        if ultimo_y > (1 - BORDA_PEIXE) * altura:
+            return 0.94 * altura
+        return ultimo_y
+
     def loop_macro(self):
         zona = dict(self.zona)
         piloto = Piloto()
@@ -522,6 +635,7 @@ class App(ctk.CTk):
         estava_pescando = False
         t_fps, n_fps, fps = time.time(), 0, 0.0
         proximo_clique = time.time()  # clica logo ao iniciar (se a barra não estiver na tela)
+        registro = deque(maxlen=2400)  # (t, barra_y, peixe_y, altura_barra, segurando, estado) para o F9
 
         with mss.mss() as sct:
             while self.ligado:
@@ -534,7 +648,7 @@ class App(ctk.CTk):
                 if ultimo_peixe_y is not None and piloto.alturas:
                     h_ref = float(np.percentile(piloto.alturas, 80))
                     limite = h_ref * (0.5 + 4.0 * (agora - ultimo_visto))
-                caixa_verde, peixe, cands = analisar(img, ultimo_peixe_y, limite)
+                caixa_verde, peixe, cands, fantasma = analisar(img, ultimo_peixe_y, limite, self.haki)
 
                 if self.pedido_captura:
                     self.pedido_captura = False
@@ -545,25 +659,41 @@ class App(ctk.CTk):
                     fps = n_fps / (relogio - t_fps)
                     n_fps, t_fps = 0, relogio
 
-                if caixa_verde is not None and peixe is not None:
+                if self.pedido_log:
+                    self.pedido_log = False
+                    self.salvar_log(registro)
+
+                # Peixe sumiu mas a barra verde continua na tela (típico: peixe colado no enfeite do topo/fundo,
+                # que vira uma mancha só encostada na borda). Soltar o clique aí fazia a barra despencar.
+                peixe_y, estado = None, "ok"
+                if peixe is not None:
+                    peixe_y = peixe["cy"]
+                elif (caixa_verde is not None and estava_pescando and ultimo_peixe_y is not None
+                      and agora - ultimo_visto < PERDA_PEIXE_S):
+                    peixe_y, estado = self.supor_peixe(ultimo_peixe_y, img.shape[0]), "suposto"
+
+                if caixa_verde is not None and peixe_y is not None:
                     # ---- minigame na tela: a barra verde acompanha o peixe ----
                     estava_pescando = True
-                    ultimo_visto = agora
-                    ultimo_peixe_y = peixe["cy"]
+                    if estado == "ok":
+                        ultimo_visto = agora
+                        ultimo_peixe_y = peixe_y
                     if relogio >= self.foto_ate:
-                        self.status = f"Pescando... ({fps:.0f} fps)"
+                        self.status = f"Pescando... ({fps:.0f} fps)" + (" - peixe sumiu, supondo" if estado != "ok" else "")
                     proximo_clique = relogio + self.intervalo  # não lança enquanto pesca
 
                     h_barra = piloto.altura_barra(caixa_verde[3])
-                    verde_y = centro_barra(caixa_verde, peixe["cy"], img.shape[0], h_barra)
-                    self.clicar(piloto.decidir(agora, verde_y, peixe["cy"], h_barra, self.antecip_ms))
+                    verde_y = centro_barra(caixa_verde, peixe_y, img.shape[0], h_barra)
+                    segurar = piloto.decidir(agora, verde_y, peixe_y, h_barra, self.antecip_ms, fantasma, self.haki)
+                    self.clicar(segurar)
+                    registro.append((agora, verde_y, peixe_y, h_barra, segurar, estado))
 
                 elif estava_pescando and agora - ultimo_visto < GRACA_S:
                     pass  # perdeu barra/peixe por um instante: mantém o último comando
 
                 else:
                     # ---- barra não apareceu (ou sumiu de vez) ----
-                    self.clicar(False)
+                    self.clicar(False, forcar=True)
                     piloto.reset()
                     ultimo_peixe_y = None
 
@@ -590,7 +720,7 @@ class App(ctk.CTk):
 
                 time.sleep(0.002)
 
-        self.clicar(False)
+        self.clicar(False, forcar=True)
 
 
 if __name__ == "__main__":
